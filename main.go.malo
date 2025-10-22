@@ -1,0 +1,664 @@
+package main
+
+import (
+	"bufio"
+	"bytes"
+	"encoding/json"
+	"fmt"
+	"io"
+	"mime/multipart"
+	"net/http"
+	"net/textproto"
+	"os"
+	"runtime"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+)
+
+// =======================
+// CONFIGURACIÓN GLOBAL
+// =======================
+
+var httpClient *http.Client
+var debugMode = true // ⚡ activa el modo debug global
+
+func init() {
+	transport := &http.Transport{
+		Proxy:                 http.ProxyFromEnvironment,
+		MaxIdleConns:          100_000,
+		MaxConnsPerHost:       0,
+		MaxIdleConnsPerHost:   10_000,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   5 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+		ForceAttemptHTTP2:     true,
+	}
+	httpClient = &http.Client{
+		Transport: transport,
+	}
+}
+
+// =======================
+// ESTRUCTURAS
+// =======================
+
+type Context struct {
+	BaseURL    string
+	Token      string
+	Documento  string
+	Correo     string
+	Radicado   int
+	Referencia string
+}
+
+// =======================
+// MAIN
+// =======================
+
+func main() {
+	if len(os.Args) < 2 {
+		fmt.Println("Uso: go run main.go <ruta-archivo-cedulas>")
+		return
+	}
+
+	filePath := os.Args[1]
+	fmt.Println("[+] Archivo de cédulas:", filePath)
+
+	numCPU := runtime.NumCPU()
+	runtime.GOMAXPROCS(numCPU)
+	threads := numCPU * 500
+	baseURL := "https://d392rp1p6w2dkx.draitest.com"
+
+	file, err := os.Open(filePath)
+	if err != nil {
+		fmt.Println("Error abriendo archivo:", err)
+		return
+	}
+	defer file.Close()
+
+	scanner := bufio.NewScanner(file)
+	var wg sync.WaitGroup
+	ch := make(chan struct{}, threads)
+	startGate := make(chan struct{})
+	var mu sync.Mutex
+	var errors, total int
+	start := time.Now()
+
+	i := 0
+	for scanner.Scan() {
+		doc := strings.TrimSpace(scanner.Text())
+		if doc == "" {
+			continue
+		}
+		wg.Add(1)
+		ch <- struct{}{}
+		i++
+
+		go func(documento string) {
+			defer func() { <-ch; wg.Done() }()
+			<-startGate
+
+			ctx := &Context{
+				BaseURL:   baseURL,
+				Documento: documento,
+				Correo:    fmt.Sprintf("prueba_carga%s@yopmail.com", documento),
+			}
+
+			if err := ejecutarFlujo(ctx); err != nil {
+				mu.Lock()
+				errors++
+				fmt.Printf("[!] [%s] ERROR: %v\n", documento, err)
+				mu.Unlock()
+			}
+
+			mu.Lock()
+			total++
+			mu.Unlock()
+		}(doc)
+
+		if i%200 == 0 {
+			time.Sleep(250 * time.Millisecond)
+		}
+	}
+
+	if err := scanner.Err(); err != nil {
+		fmt.Println("Error leyendo archivo:", err)
+	}
+
+	close(startGate)
+	wg.Wait()
+
+	elapsed := time.Since(start)
+	rps := float64(total) / elapsed.Seconds()
+
+	fmt.Printf("\n=== Completadas %d ejecuciones en %.2f s usando %d hilos (%d núcleos) ===\n",
+		total, elapsed.Seconds(), threads, numCPU)
+	fmt.Printf("≈ %.2f requests/segundo | Errores: %d\n", rps, errors)
+}
+
+// =======================
+// FLUJO
+// =======================
+
+func ejecutarFlujo(ctx *Context) error {
+	fmt.Printf("flujo")
+	pasos := []func(*Context) error{
+		paso1VerificarPreinscripcion,
+		paso2VerificarPreinscripcionCorreo,
+		paso3RegistrarPreinscripcion,
+		paso4Autenticacion,
+		func(c *Context) error { _, err := paso5ObtenerInscripcion(c); return err },
+		func(c *Context) error { _, err := paso6ObtenerPago(c); return err },
+	}
+	for i, fn := range pasos {
+		if err := fn(ctx); err != nil {
+			return fmt.Errorf("❌ Paso %d falló: %v", i+1, err)
+		}
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(3)
+	go func() { defer wg.Done(); paso7ObtenerDepartamentos(ctx) }()
+	go func() { defer wg.Done(); paso8ObtenerSitiosEvaluacion(ctx) }()
+	go func() { defer wg.Done(); paso9ObtenerEstablecimientos(ctx) }()
+	wg.Wait()
+
+	pasos2 := []func(*Context) error{
+		paso10RegistrarPago,
+		paso11RegistrarInscripcion,
+		paso12ModificarInscripcion,
+	}
+	for i, fn := range pasos2 {
+		if err := fn(ctx); err != nil {
+			return fmt.Errorf("❌ Paso %d (parte 2) falló: %v", i+10, err)
+		}
+	}
+	return nil
+}
+
+// =======================
+// HELPERS
+// =======================
+
+func ejecutarRequest(nombrePaso, metodo, url string, body io.Reader, ctx *Context, extraHeaders map[string]string) (*http.Response, error) {
+	req, err := http.NewRequest(metodo, url, body)
+	if err != nil {
+		return nil, fmt.Errorf("%s: error creando request: %v", nombrePaso, err)
+	}
+
+	setDefaultHeaders(req)
+	for k, v := range extraHeaders {
+		req.Header.Set(k, v)
+	}
+
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("%s: error ejecutando request: %v", nombrePaso, err)
+	}
+
+	if resp.StatusCode != 200 && debugMode {
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 300))
+		fmt.Printf("[DEBUG][%s] %s %s -> STATUS: %d\nBODY: %s\n",
+			nombrePaso, metodo, url, resp.StatusCode, string(b))
+		resp.Body.Close()
+		return nil, fmt.Errorf("%s: status %d", nombrePaso, resp.StatusCode)
+	}
+	return resp, nil
+}
+
+func setDefaultHeaders(req *http.Request) {
+	req.Header.Set("Accept", "application/json, text/plain, */*")
+	req.Header.Set("Connection", "keep-alive")
+}
+
+// =======================
+// PASOS
+// =======================
+
+func paso1VerificarPreinscripcion(ctx *Context) error {
+	fmt.Printf("1")
+	url := fmt.Sprintf("%s/inscripciones/inscripcion/rc/verificar-preinscripcion?idConcurso=1&documento=%s", ctx.BaseURL, ctx.Documento)
+	resp, err := ejecutarRequest("Paso1", "GET", url, nil, ctx, nil)
+	if resp != nil {
+		resp.Body.Close()
+	}
+	return err
+}
+
+func paso2VerificarPreinscripcionCorreo(ctx *Context) error {
+	fmt.Printf("2")
+	url := fmt.Sprintf("%s/inscripciones/inscripcion/rc/verificar-preinscripcion?idConcurso=1&documento=%s&correo=%s", ctx.BaseURL, ctx.Documento, ctx.Correo)
+	resp, err := ejecutarRequest("Paso2", "GET", url, nil, ctx, nil)
+	if resp != nil {
+		resp.Body.Close()
+	}
+	return err
+}
+
+func paso3RegistrarPreinscripcion(ctx *Context) error {
+	fmt.Printf("3")
+	url := ctx.BaseURL + "/inscripciones/inscripcion/rc/preinscripcion"
+	body := fmt.Sprintf(`{"persona":{"documento":"%s","email":"%s"},"idConcurso":1,"contrasena":"*05310914Prueba"}`, ctx.Documento, ctx.Correo)
+	resp, err := ejecutarRequest("Paso3", "POST", url, strings.NewReader(body), ctx, map[string]string{"Content-Type": "application/json"})
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	data, _ := io.ReadAll(resp.Body)
+	if idx := bytes.Index(data, []byte(`"radicado":`)); idx > 0 {
+		fmt.Sscanf(string(data[idx:]), `"radicado":%d`, &ctx.Radicado)
+	}
+	return nil
+}
+
+func paso4Autenticacion(ctx *Context) error {
+	fmt.Printf("4")
+	url := ctx.BaseURL + "/inscripciones/sistema/rc/autenticacion"
+	body := map[string]interface{}{"radicado": ctx.Radicado, "contrasena": "*05310914Prueba"}
+	jsonBody, _ := json.Marshal(body)
+	resp, err := ejecutarRequest("Paso4", "POST", url, bytes.NewReader(jsonBody), ctx, map[string]string{"Content-Type": "application/json"})
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	var data struct{ Token string `json:"token"` }
+	json.NewDecoder(resp.Body).Decode(&data)
+	ctx.Token = data.Token
+	return nil
+}
+
+func paso5ObtenerInscripcion(ctx *Context) (string, error) {
+	fmt.Printf("5")
+	url := ctx.BaseURL + "/inscripciones/inscripcion/actual"
+	headers := map[string]string{"Authorization": "bearer " + ctx.Token}
+	resp, err := ejecutarRequest("Paso5", "GET", url, nil, ctx, headers)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	data, _ := io.ReadAll(resp.Body)
+	return string(data), nil
+}
+
+func paso6ObtenerPago(ctx *Context) (string, error) {
+	url := ctx.BaseURL + "/inscripciones/pago"
+	req, _ := http.NewRequest(http.MethodGet, url, nil)
+	setDefaultHeaders(req)
+	req.Header.Set("Authorization", "bearer "+ctx.Token)
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		body, _ := io.ReadAll(resp.Body)
+		return "", fmt.Errorf("status %d: %s", resp.StatusCode, string(body))
+	}
+	var r struct{ Referencia string `json:"referencia"` }
+	json.NewDecoder(resp.Body).Decode(&r)
+	ctx.Referencia = r.Referencia
+	return r.Referencia, nil
+}
+
+func paso7ObtenerDepartamentos(ctx *Context) (string, error) {
+	url := ctx.BaseURL + "/inscripciones/publico/dane/departamentos"
+	req, _ := http.NewRequest("GET", url, nil)
+	setDefaultHeaders(req)
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	b, _ := io.ReadAll(resp.Body)
+	return string(b), nil
+}
+
+func paso8ObtenerSitiosEvaluacion(ctx *Context) (string, error) {
+	url := ctx.BaseURL + "/inscripciones/publico/dane/sitios-evaluacion"
+	req, _ := http.NewRequest("GET", url, nil)
+	setDefaultHeaders(req)
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	b, _ := io.ReadAll(resp.Body)
+	return string(b), nil
+}
+
+func paso9ObtenerEstablecimientos(ctx *Context) (string, error) {
+	url := ctx.BaseURL + "/inscripciones/publico/dane/establecimientos?codigoMunicipio=5001"
+	req, _ := http.NewRequest("GET", url, nil)
+	setDefaultHeaders(req)
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	b, _ := io.ReadAll(resp.Body)
+	return string(b), nil
+}
+
+func paso10RegistrarPago(ctx *Context) error {
+	url := ctx.BaseURL + "/inscripciones/pago/confirmar/" + ctx.Referencia
+	req, _ := http.NewRequest("GET", url, nil)
+	req.Header.Set("token", "Gr$1yN0mTNd6o|0bh8(=")
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		b, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("error paso10: %s", string(b))
+	}
+	return nil
+}
+
+func paso11RegistrarInscripcion(ctx *Context) error {
+	docNum, err := strconv.Atoi(ctx.Documento)
+    if err != nil {
+        return fmt.Errorf("documento no es un número válido: %v", err)
+    }
+
+    pdfHardcodeado := []byte(`%PDF-1.4
+% ... contenido mínimo de PDF ...
+%%EOF`)
+
+    var body bytes.Buffer
+    writer := multipart.NewWriter(&body)
+
+    // PDF solo en 10% de los casos
+    if docNum%10 == 0 {
+        h := make(textproto.MIMEHeader)
+        h.Set("Content-Disposition", `form-data; name="certificadoDiscapacidad"; filename="anexo.pdf"`)
+        h.Set("Content-Type", "application/pdf")
+        fw, err := writer.CreatePart(h)
+        if err != nil {
+            return fmt.Errorf("error creando form file PDF: %v", err)
+        }
+        _, err = fw.Write(pdfHardcodeado)
+        if err != nil {
+            return fmt.Errorf("error copiando PDF: %v", err)
+        }
+    }
+
+    // JSON de inscripción
+    inscripcionJSON := fmt.Sprintf(`{
+    "radicado": %d,
+    "persona": {
+        "id": 106594,
+        "tipoDocumento": "CC",
+        "documento": "%s",
+        "primerNombre": "Andres",
+        "segundoNombre": "Camilo",
+        "primerApellido": "Osorno",
+        "segundoApellido": "Zapata",
+        "email": "%s",
+        "inconsistencias": [],
+        "ciudad": {
+            "id": 5030,
+            "nombre": "Amagá",
+            "departamento": {
+                "id": 5,
+                "nombre": "Antioquia"
+            }
+        },
+        "telefono1": "3207775032",
+        "telefono2": "3207775032",
+        "fechaNacimiento": "1990-06-30T05:00:00.000Z",
+        "sexo": "M",
+        "tieneDiscapacidad": "SI",
+        "tipoDiscapacidad": "Sensorial - Ceguera",
+        "necesitaAsistenciaParaPruebas": "NO"
+    },
+    "estadoInscrito": {
+        "id": 1,
+        "nombreEstado": "Preinscrito"
+    },
+    "concurso": {
+        "id": 1
+    },
+    "convocatoria": {
+        "id": 0,
+        "esActiva": false
+    },
+    "borrado": false,
+    "tieneCitaciones": false,
+    "causalesInadmision": [],
+    "inconsistencias": [],
+    "cargo": "Docente de aula",
+    "nivelDesempeno": "Media",
+    "areaDesempeno": "MATTTES",
+    "fechaVinculacion": "2012-11-23T05:00:00.000Z",
+    "tiempoServicioMeses": 98,
+    "numeroMovimientos": 1,
+    "nivelEducativo": "Especialización",
+    "nivelEducativoEtc": "Maestría",
+    "formacionAcademica": "Licenciado",
+    "detalleFormacionAcademica": "Matematicas",
+    "gradoEscalafonActual": 1,
+    "nivelEscalafonActual": "A",
+    "gradoEscalafonAspira": 2,
+    "nivelEscalafonAspira": "A",
+    "sede": {
+        "codigo": 105001000001,
+        "nombre": "INSTITUCIÓN EDUCATIVA FE Y ALEGRIA JOSÉ MARÍA VELAZ",
+        "secretaria": "MEDELLIN",
+        "daneEstablecimiento": {
+            "codigo": 105001000001,
+            "nombre": "INSTITUCIÓN EDUCATIVA FE Y ALEGRIA JOSÉ MARIA VELAZ"
+        },
+        "municipioSede": {
+            "id": 5001,
+            "nombre": "Medellín",
+            "departamento": {
+                "id": 5,
+                "nombre": "Antioquia"
+            }
+        }
+    },
+    "sitioEvaluacion": {
+        "id": 5615,
+        "nombre": "Rionegro\r\n",
+        "departamento": {
+            "id": 5,
+            "nombre": "Antioquia"
+        }
+    },
+    "pruebaPedagogicaAplicar": "Docente de aula preescolar",
+    "fechaAceptacionLugarPrueba": "2025-10-16T21:02:14.771Z",
+    "fechaAceptacionTerminosInscripcion": "1970-01-01T00:00:00.000Z",
+    "fechaInscripcion": "2025-10-16T21:03:51.566Z"
+}`, ctx.Radicado, ctx.Documento, ctx.Correo)
+
+    h := make(textproto.MIMEHeader)
+    h.Set("Content-Disposition", `form-data; name="inscripcion"; filename="blob"`)
+    h.Set("Content-Type", "application/json")
+    fw, err := writer.CreatePart(h)
+    if err != nil {
+        return fmt.Errorf("error creando form file JSON: %v", err)
+    }
+    _, err = fw.Write([]byte(inscripcionJSON))
+    if err != nil {
+        return fmt.Errorf("error copiando JSON: %v", err)
+    }
+
+    writer.Close()
+
+    req, err := http.NewRequest("POST", ctx.BaseURL+"/inscripciones/inscripcion", &body)
+    if err != nil {
+        return fmt.Errorf("error creando request: %v", err)
+    }
+
+    req.Header.Set("Authorization", "bearer "+ctx.Token)
+    req.Header.Set("Content-Type", writer.FormDataContentType())
+
+    resp, err := http.DefaultClient.Do(req)
+    if err != nil {
+        return fmt.Errorf("error ejecutando request: %v", err)
+    }
+    defer resp.Body.Close()
+
+    //respBody, _ := io.ReadAll(resp.Body)
+
+    if resp.StatusCode != 200 {
+        return fmt.Errorf("error paso 11, status: %d", resp.StatusCode)
+    }
+
+	return nil
+}
+
+func paso12ModificarInscripcion(ctx *Context) error {
+	docNum, err := strconv.Atoi(ctx.Documento)
+    if err != nil {
+        return fmt.Errorf("documento no es un número válido: %v", err)
+    }
+
+    pdfHardcodeado := []byte(`%PDF-1.4
+% ... contenido mínimo de PDF ...
+%%EOF`)
+
+    var body bytes.Buffer
+    writer := multipart.NewWriter(&body)
+
+    // Enviar PDF solo en 10% de los casos
+    if docNum%10 == 0 {
+        h := make(textproto.MIMEHeader)
+        h.Set("Content-Disposition", `form-data; name="certificadoDiscapacidad"; filename="anexo.pdf"`)
+        h.Set("Content-Type", "application/pdf")
+        fw, err := writer.CreatePart(h)
+        if err != nil {
+            return fmt.Errorf("error creando form file PDF: %v", err)
+        }
+        _, err = fw.Write(pdfHardcodeado)
+        if err != nil {
+            return fmt.Errorf("error copiando PDF: %v", err)
+        }
+    }
+
+    // JSON de modificación de inscripción
+    inscripcionJSON := fmt.Sprintf(`{
+        "radicado": %d,
+        "persona": {
+            "id": 106569,
+            "tipoDocumento": "CC",
+            "documento": "%s",
+            "primerNombre": "PEDRO",
+            "segundoNombre": "PEDRO PABLO",
+            "primerApellido": "GALLEGO",
+            "segundoApellido": "GALLEGO PINZON",
+            "email": "%s",
+            "inconsistencias": [],
+            "ciudad": {"id":11001,"nombre":"Bogotá D.C.","departamento":{"id":11,"nombre":"Bogotá D.C."}},
+            "telefono1": "3112163766",
+            "telefono2": null,
+            "fechaNacimiento": "2007-09-01T05:00:00.000Z",
+            "sexo": "M",
+            "tieneDiscapacidad": "SI",
+            "tipoDiscapacidad": "Sensorial - Sordera Profunda,Sensorial - Hipoacusia",
+            "necesitaAsistenciaParaPruebas": "SI",
+            "tipoAsistenciaParaPruebas": "Apoyo de accesibilidad"
+        },
+        "estadoInscrito":{"id":1,"nombreEstado":"Preinscrito"},
+        "concurso":{"id":1},
+        "convocatoria":{"id":1,"codigoConvocatoria":"01-0001","denominacion":"profesional ascenso","esActiva":false},
+        "borrado": false,
+        "tieneCitaciones": false,
+        "causalesInadmision": [],
+        "inconsistencias": [],
+        "cargo": "Docente de aula",
+        "nivelDesempeno": "Preescolar",
+        "areaDesempeno": "YYYY",
+        "fechaVinculacion": "2025-09-25T05:00:00.000Z",
+        "tiempoServicioMeses": 52,
+        "numeroMovimientos": 4,
+        "nivelEducativo": "Pregrado",
+        "nivelEducativoEtc": "No aplica",
+        "formacionAcademica": "Profesional no licenciado",
+        "detalleFormacionAcademica": "ddddd",
+        "gradoEscalafonActual": 1,
+        "nivelEscalafonActual": "B",
+        "gradoEscalafonAspira": 1,
+        "nivelEscalafonAspira": "C",
+        "sede": {
+            "codigo": 105001000001,
+            "nombre": "INSTITUCIÓN EDUCATIVA FE Y ALEGRIA JOSÉ MARÍA VELAZ",
+            "secretaria": "MEDELLIN",
+            "daneEstablecimiento": {
+                "codigo": 105001000001,
+                "nombre": "INSTITUCIÓN EDUCATIVA FE Y ALEGRIA JOSÉ MARIA VELAZ"
+            },
+            "municipioSede": {
+                "id": 5001,
+                "nombre": "Medellín",
+                "departamento": {"id": 5, "nombre": "Antioquia"}
+            }
+        },
+        "sitioEvaluacion": {
+            "id": 11001,
+            "nombre": "Bogotá D.C.",
+            "departamento": {"id": 11, "nombre": "Bogotá D.C."}
+        },
+        "pruebaPedagogicaAplicar": "Coordinador (a)",
+        "fechaAceptacionLugarPrueba": "2025-09-26T19:58:41.756Z",
+        "fechaAceptacionTerminosInscripcion": "1970-01-01T00:00:00.000Z",
+        "fechaInscripcion": "2025-09-26T19:59:04.868Z"
+    }`, ctx.Radicado, ctx.Documento, ctx.Correo)
+
+    // Parte JSON
+    h := make(textproto.MIMEHeader)
+    h.Set("Content-Disposition", `form-data; name="inscripcion"; filename="blob"`)
+    h.Set("Content-Type", "application/json")
+    fw, err := writer.CreatePart(h)
+    if err != nil {
+        return fmt.Errorf("error creando form file JSON: %v", err)
+    }
+    _, err = fw.Write([]byte(inscripcionJSON))
+    if err != nil {
+        return fmt.Errorf("error copiando JSON: %v", err)
+    }
+
+    writer.Close()
+
+    // Request HTTP
+    req, err := http.NewRequest("POST", ctx.BaseURL+"/inscripciones/inscripcion/actualizacion", &body)
+    if err != nil {
+        return fmt.Errorf("error creando request: %v", err)
+    }
+
+    req.Header.Set("Authorization", "bearer "+ctx.Token)
+    req.Header.Set("Content-Type", writer.FormDataContentType())
+
+    resp, err := http.DefaultClient.Do(req)
+    if err != nil {
+        return fmt.Errorf("error ejecutando request: %v", err)
+    }
+    defer resp.Body.Close()
+
+    if resp.StatusCode != 200 {
+        return fmt.Errorf("error paso 12, status: %d", resp.StatusCode)
+    }
+
+    fmt.Printf("Listo Usuario %s, Resultado: %d \n", ctx.Documento, resp.StatusCode)
+	
+	return nil
+}
+
+func ejecutarGET(ctx *Context, url string) error {
+	req, _ := http.NewRequest("GET", url, nil)
+	setDefaultHeaders(req)
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		b, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("status %d: %s", resp.StatusCode, string(b))
+	}
+	return nil
+}
+

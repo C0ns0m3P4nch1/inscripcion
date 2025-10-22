@@ -10,24 +10,45 @@ import (
     "mime/multipart"
     "os"
     "sync"
-	//"bufio"
+	"bufio"
     "strconv"
-    //"runtime"
+    "runtime"
     "strings"
     "time"
 )
 
 // === CLIENTE HTTP OPTIMIZADO ===
-var httpClient = &http.Client{
-    Transport: &http.Transport{
-        MaxIdleConns:        100000,
-        MaxIdleConnsPerHost: 100000,
-        MaxConnsPerHost:     0,
-        IdleConnTimeout:     0,
-        DisableKeepAlives:   false,
-        ForceAttemptHTTP2:   true, // permite HTTP/2 si el server lo soporta
-    },
+// var httpClient = &http.Client{
+//     Transport: &http.Transport{
+//         MaxIdleConns:        100000,
+//         MaxIdleConnsPerHost: 100000,
+//         MaxConnsPerHost:     0,
+//         IdleConnTimeout:     0,
+//         DisableKeepAlives:   false,
+//         ForceAttemptHTTP2:   true, // permite HTTP/2 si el server lo soporta
+//     },
+// }
+
+var client *http.Client
+var httpClient *http.Client // alias compatible con tus funciones viejas
+
+func init() {
+    transport := &http.Transport{
+        MaxIdleConns:        4096,
+        MaxIdleConnsPerHost: 2048,
+        IdleConnTimeout:     90 * time.Second,
+        TLSHandshakeTimeout: 5 * time.Second,
+        DisableCompression:  false,
+    }
+
+    client = &http.Client{
+        Transport: transport,
+        Timeout:   60 * time.Second,
+    }
+
+    httpClient = client // ✅ aquí sí se inicializa el alias correctamente
 }
+
 
 var (
     usuarios     []string
@@ -45,51 +66,51 @@ type Context struct {
 }
 
 // === MAIN ===
-func main() {
-    inicializarUsuariosDesdeArchivo()
+// func main() {
+//     inicializarUsuariosDesdeArchivo()
     
-    numUsuarios := 1000   // cuántos usuarios quieres simular
-    // numWorkers ya no es necesario en este enfoque; crearemos N goroutines
-    startCh := make(chan struct{})   // puerta de inicio
-    var doneWG sync.WaitGroup
-    doneWG.Add(numUsuarios)
+//     numUsuarios := 1000   // cuántos usuarios quieres simular
+//     // numWorkers ya no es necesario en este enfoque; crearemos N goroutines
+//     startCh := make(chan struct{})   // puerta de inicio
+//     var doneWG sync.WaitGroup
+//     doneWG.Add(numUsuarios)
 
-    // preparar lista de documentos (puedes leer desde archivo o generar)
-    documentos := make([]string, 0, numUsuarios)
-    for i := 0; i < numUsuarios; i++ {
-        documentos = append(documentos, siguienteUsuario()) // o genera
-    }
+//     // preparar lista de documentos (puedes leer desde archivo o generar)
+//     documentos := make([]string, 0, numUsuarios)
+//     for i := 0; i < numUsuarios; i++ {
+//         documentos = append(documentos, siguienteUsuario()) // o genera
+//     }
 
-    // crear goroutines (preparadas, esperando startCh)
-    for i := 0; i < numUsuarios; i++ {
-        doc := documentos[i]
-        go func(documento string, id int) {
-            defer doneWG.Done()
-            correo := fmt.Sprintf("prueba_carga%s@yopmail.com", documento)
-            ctx := &Context{
-                BaseURL:   "https://d392rp1p6w2dkx.draitest.com",
-                Documento: documento,
-                Correo:    correo,
-            }
+//     // crear goroutines (preparadas, esperando startCh)
+//     for i := 0; i < numUsuarios; i++ {
+//         doc := documentos[i]
+//         go func(documento string, id int) {
+//             defer doneWG.Done()
+//             correo := fmt.Sprintf("prueba_carga%s@yopmail.com", documento)
+//             ctx := &Context{
+//                 BaseURL:   "https://d392rp1p6w2dkx.draitest.com",
+//                 Documento: documento,
+//                 Correo:    correo,
+//             }
 
-            // Espera la señal de inicio (start gate)
-            <-startCh
+//             // Espera la señal de inicio (start gate)
+//             <-startCh
 
-            // Ejecuta el flujo (esto será lanzado "casi" simultáneamente)
-            if err := ejecutarFlujo(ctx); err != nil {
-                // Aquí puedes loguear a un canal o contador en vez de imprimir (evita mucho I/O)
-                fmt.Printf("[Error] usuario %s: %v\n", documento, err)
-            }
-        }(doc, i+1)
-    }
+//             // Ejecuta el flujo (esto será lanzado "casi" simultáneamente)
+//             if err := ejecutarFlujo(ctx); err != nil {
+//                 // Aquí puedes loguear a un canal o contador en vez de imprimir (evita mucho I/O)
+//                 fmt.Printf("[Error] usuario %s: %v\n", documento, err)
+//             }
+//         }(doc, i+1)
+//     }
 
-    // --- medición ---
-    t0 := time.Now()
-    close(startCh)       // libera a todas las goroutines a la vez
-    doneWG.Wait()
-    elapsed := time.Since(t0)
-    fmt.Printf("Completadas %d ejecuciones en %v\n", numUsuarios, elapsed)
-}
+//     // --- medición ---
+//     t0 := time.Now()
+//     close(startCh)       // libera a todas las goroutines a la vez
+//     doneWG.Wait()
+//     elapsed := time.Since(t0)
+//     fmt.Printf("Completadas %d ejecuciones en %v\n", numUsuarios, elapsed)
+// }
 
 // func main() {
 //     if len(os.Args) < 2 {
@@ -103,7 +124,6 @@ func main() {
 //     // === 🔥 Usa los 8 núcleos detectados ===
 //     numCPU := runtime.NumCPU()
 //     runtime.GOMAXPROCS(numCPU)
-//     fmt.Printf("[+] Núcleos detectados: %d — todos en uso\n", numCPU)
 
 //     // Ajuste de hilos simultáneos
 //     // ⚠️ No uses miles, el límite real de rendimiento está entre 500–2000 dependiendo del servidor y tu red.
@@ -162,6 +182,75 @@ func main() {
 //         i, elapsed.Seconds(), threads, numCPU)
 // }
 
+func main() {
+    if len(os.Args) < 2 {
+        fmt.Println("Uso: go run main.go <ruta-archivo-cedulas>")
+        return
+    }
+
+    filePath := os.Args[1]
+    fmt.Println("[+] Archivo de cédulas:", filePath)
+
+    numCPU := runtime.NumCPU()
+    runtime.GOMAXPROCS(numCPU)
+
+    threads := numCPU * 250 // 2000 goroutines aprox
+    baseURL := "https://d392rp1p6w2dkx.draitest.com"
+
+    file, err := os.Open(filePath)
+    if err != nil {
+        fmt.Println("Error abriendo archivo:", err)
+        return
+    }
+    defer file.Close()
+
+    scanner := bufio.NewScanner(file)
+    var wg sync.WaitGroup
+    ch := make(chan struct{}, threads)
+
+    start := time.Now()
+    i := 0
+    errors := 0
+
+    for scanner.Scan() {
+        documento := strings.TrimSpace(scanner.Text())
+        if documento == "" {
+            continue
+        }
+
+        wg.Add(1)
+        ch <- struct{}{}
+
+        go func(id int, doc string) {
+            defer func() { <-ch; wg.Done() }()
+
+            correo := fmt.Sprintf("prueba_carga%s@yopmail.com", doc)
+            ctx := &Context{
+                BaseURL:   baseURL,
+                Documento: doc,
+                Correo:    correo,
+            }
+
+            if err := ejecutarFlujo(ctx); err != nil {
+                fmt.Printf("[!] Error %s: %v\n", doc, err)
+                errors++
+            }
+        }(i, documento)
+        i++
+    }
+
+    if err := scanner.Err(); err != nil {
+        fmt.Println("Error leyendo archivo:", err)
+    }
+
+    wg.Wait()
+    elapsed := time.Since(start)
+
+    rps := float64(i) / elapsed.Seconds()
+    fmt.Printf("\n=== Completadas %d ejecuciones en %.2f s usando %d hilos (%d núcleos) ===\n",
+        i, elapsed.Seconds(), threads, numCPU)
+    fmt.Printf("≈ %.2f requests/segundo | Errores: %d\n", rps, errors)
+}
 
 
 // === FLUJO GENERAL ===
